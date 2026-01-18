@@ -99,3 +99,7 @@ log
 
 # Coredumps
 *.core
+
+# Local agent notes / plans
+AGENTS.md
+docs/plans/git-aware-recent-coverage-scheduler.md
