@@ -70,6 +70,14 @@ static bool is_sancov_init_function(StringRef name) {
   return name == "__sanitizer_cov_trace_pc_guard_init";
 }
 
+static const Function *called_function_stripped(const CallBase *CB) {
+  if (!CB) { return nullptr; }
+  Value *V = CB->getCalledOperand();
+  if (!V) { return nullptr; }
+  V = V->stripPointerCasts();
+  return dyn_cast<Function>(V);
+}
+
 static bool resolve_guard_ptr(Value *V, const GlobalVariable *&out_gv,
                               uint64_t &out_idx) {
   if (!V) { return false; }
@@ -106,7 +114,7 @@ static DebugLoc find_first_non_instrumentation_debugloc(const BasicBlock &BB) {
     if (isa<DbgInfoIntrinsic>(&I)) { continue; }
 
     if (auto *CB = dyn_cast<CallBase>(&I)) {
-      if (auto *Callee = CB->getCalledFunction()) {
+      if (auto *Callee = called_function_stripped(CB)) {
         auto name = Callee->getName();
         if (is_sancov_trace_function(name) || is_sancov_init_function(name)) {
           continue;
@@ -153,7 +161,7 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
         for (auto &I : BB) {
           auto *CB = dyn_cast<CallBase>(&I);
           if (!CB) { continue; }
-          auto *Callee = CB->getCalledFunction();
+          auto *Callee = called_function_stripped(CB);
           if (!Callee) { continue; }
           if (!is_sancov_init_function(Callee->getName())) { continue; }
           if (CB->arg_size() < 2) { continue; }
@@ -202,7 +210,7 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
         for (auto &I : BB) {
           auto *CB = dyn_cast<CallBase>(&I);
           if (!CB) { continue; }
-          auto *Callee = CB->getCalledFunction();
+          auto *Callee = called_function_stripped(CB);
           if (!Callee) { continue; }
 
           if (!is_sancov_trace_function(Callee->getName())) { continue; }
@@ -295,4 +303,3 @@ llvmGetPassPluginInfo() {
                 ) { MPM.addPass(GitRecencyPass()); });
           }};
 }
-
