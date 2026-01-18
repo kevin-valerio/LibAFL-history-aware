@@ -566,10 +566,22 @@ impl ToolWrapper for ClangWrapper {
                         continue;
                     }
                     if arg.ends_with(".a") {
-                        return Err(Error::Unknown(
-                            "git recency mapping v1 does not support .a archives on the link line"
-                                .to_string(),
-                        ));
+                        // v1 doesn't support static archives that contain instrumented objects
+                        // (guard ordering depends on which members get pulled in).
+                        // However, our own wrappers often link Rust staticlibs (like the fuzzer
+                        // harness) which do not contain `-fsanitize-coverage=trace-pc-guard`
+                        // guards. Allow those.
+                        let bytes = std::fs::read(arg).map_err(Error::Io)?;
+                        if bytes
+                            .windows(b"__sancov_guards".len())
+                            .any(|w| w == b"__sancov_guards")
+                        {
+                            return Err(Error::Unknown(
+                                "git recency mapping v1 does not support instrumented .a archives on the link line"
+                                    .to_string(),
+                            ));
+                        }
+                        continue;
                     }
                     if arg.ends_with(".o") || arg.ends_with(".obj") {
                         object_files.push(PathBuf::from(arg));

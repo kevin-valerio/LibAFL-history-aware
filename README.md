@@ -1,8 +1,11 @@
-# `LibAFL`, the fuzzer library
+# `LibAFL-history-aware` (a `LibAFL` fork)
 
  <img align="right" src="https://raw.githubusercontent.com/AFLplusplus/Website/main/static/libafl_logo.svg" alt="LibAFL logo" width="250" heigh="250">
 
 Advanced Fuzzing Library - Slot your own fuzzers together and extend their features using Rust.
+
+This repository is a fork of [`AFLplusplus/LibAFL`](https://github.com/AFLplusplus/LibAFL) focused on **history-aware scheduling**:
+it keeps classic coverage-guided fuzzing, but additionally biases corpus scheduling toward inputs that execute **recently changed code**, based on `git blame`.
 
 `LibAFL` is a collection of reusable pieces of fuzzers, written in Rust, it gives you many of the benefits of an off-the-shelf fuzzer, while being completely customizable.
 Some highlight features currently include:
@@ -13,6 +16,97 @@ Some highlight features currently include:
 feel free to add an AST-based input for structured fuzzing, and more.
 - `multi platform`: `LibAFL` runs on *Windows*, *macOS*, *iOS*, *Linux*, and *Android*, and more. `LibAFL` can be built in `no_std` mode to inject `LibAFL` into obscure targets like embedded devices and hypervisors.
 - `bring your own target`: We support binary-only modes, like Frida-Mode, as well as multiple compilation passes for sourced-based instrumentation. Of course it's easy to add custom instrumentation backends.
+
+## This fork: Git-aware / recently-changed coverage scheduling
+
+### What it does
+
+- Keeps coverage-guided fuzzing unchanged by default.
+- Adds an **opt-in scheduling bias** that prefers testcases that execute code that was **recently modified or added**.
+- “Recent” is defined by the last-modifying commit time from `git blame` (`%ct`, epoch seconds).
+
+This is useful when you suspect a regression or a bug is likely to be in new code and you want to find it faster than with baseline scheduling alone.
+
+### How it works (high-level)
+
+1. **Build time (once per final binary)**:
+   - A small LLVM pass records a mapping from SanitizerCoverage `trace-pc-guard` indices to source locations (`file:line`) for each object file.
+   - At the final link step (still via the `libafl_cc` wrapper), those per-object mappings are merged and `git blame` is used to turn `file:line` into an epoch timestamp.
+   - The result is written as a single binary vector mapping file:
+     - `u64 head_time_epoch_seconds`
+     - `u64 len`
+     - `len * u64` entries where `entries[index] = epoch_seconds`
+2. **Fuzzer startup**:
+   - The fuzzer loads the mapping file into state metadata (`GitRecencyMapMetadata`).
+3. **Scheduling/scoring**:
+   - Each testcase gets a cached “recentness” timestamp: `tc_time = max(entries[idx])` over its covered indices (`MapIndexesMetadata`).
+   - The scheduler boosts the testcase weight by `1 + alpha * decay(tc_time)`, where:
+     - `age = head_time - tc_time`
+     - `decay = 2^(-age / half_life)` and `half_life = 14 days`
+   - Unknown or unmapped locations are treated as “old” (no boost).
+
+### How to use it
+
+#### 1) Generate the mapping file at build time
+
+The mapping is **opt-in** and is generated only if you set:
+
+- `LIBAFL_GIT_RECENCY_MAPPING_PATH=/path/to/git_recency_map.bin`
+
+Then build your target with a `libafl_cc`-based wrapper (many example fuzzers ship one under `fuzzers/**/src/bin/libafl_cc.rs`).
+
+Example (build the provided wrappers, then use them as `CC`/`CXX`):
+
+```sh
+# Build the wrappers
+cargo build --release -p forkserver_libafl_cc --bin libafl_cc
+cargo build --release -p forkserver_libafl_cc --bin libafl_cxx
+
+export CC="$(pwd)/target/release/libafl_cc"
+export CXX="$(pwd)/target/release/libafl_cxx"
+
+# Enable mapping generation (written at the final link step)
+export LIBAFL_GIT_RECENCY_MAPPING_PATH="$(pwd)/git_recency_map.bin"
+
+# Build your target using the wrappers (example)
+make CC="$CC" CXX="$CXX" -j"$(nproc)"
+```
+
+Notes:
+- This feature uses SanitizerCoverage `trace-pc-guard` indices. Your target must be compiled with that instrumentation.
+- Debug info (`-g`) is required to map coverage sites to `file:line` (the wrappers add `-g` by default).
+- v1 limitation: static archives (`.a`) on the link line are **not supported** for mapping generation.
+
+#### 2) Use the git-aware scheduler in your fuzzer
+
+At fuzzer startup:
+
+- Load the mapping file into the state (`GitRecencyMapMetadata`).
+- Ensure your map observer enables index tracking (`.track_indices()`), so `MapIndexesMetadata` is available.
+- Switch from `StdWeightedScheduler` to `GitAwareStdWeightedScheduler` (or use `GitRecencyTestcaseScore` directly).
+
+The bias strength is controlled via `GitRecencyConfigMetadata { alpha }` (default `alpha = 2.0`).
+
+Minimal sketch (exact types vary by fuzzer):
+
+```rust
+use libafl::{
+    HasMetadata,
+    observers::{CanTrack, StdMapObserver},
+    schedulers::{
+        GitAwareStdWeightedScheduler, GitRecencyConfigMetadata, GitRecencyMapMetadata,
+    },
+};
+
+// Important: enable index tracking so MapIndexesMetadata exists.
+let edges_observer = StdMapObserver::owned("edges", vec![0u8; 65536]).track_indices();
+
+// Load the mapping generated at build time (see LIBAFL_GIT_RECENCY_MAPPING_PATH).
+state.add_metadata(GitRecencyMapMetadata::load_from_file("git_recency_map.bin")?);
+state.add_metadata(GitRecencyConfigMetadata::new(2.0));
+
+let scheduler = GitAwareStdWeightedScheduler::new(&mut state, &edges_observer);
+```
 
 ## Core concepts
 
@@ -45,7 +139,7 @@ feel free to add an AST-based input for structured fuzzing, and more.
 #### Clone the `LibAFL` repository with
 
 ```sh
-git clone https://github.com/AFLplusplus/LibAFL
+git clone https://github.com/kevin-valerio/LibAFL-history-aware.git
 ```
 
 #### Build the library using
@@ -82,6 +176,7 @@ You can run each example fuzzer with this following command, as long as the fuzz
 - [Installation guide](./docs/src/getting_started/setup.md)
 - [Online API documentation](https://docs.rs/libafl/)
 - The `LibAFL` book (WIP) [online](https://aflplus.plus/libafl-book) or in the [repo](./docs/src/)
+- Git-aware scheduling plan: [`docs/plans/git-aware-recent-coverage-scheduler.md`](./docs/plans/git-aware-recent-coverage-scheduler.md)
 - Our research [paper](https://www.s3.eurecom.fr/docs/ccs22_fioraldi.pdf)
 - Our RC3 [talk](http://www.youtube.com/watch?v=3RWkT1Q5IV0 "Fuzzers Like LEGO") explaining the core concepts
 - Our Fuzzcon Europe [talk](https://www.youtube.com/watch?v=PWB8GIhFAaI "LibAFL: The Advanced Fuzzing Library") with a (a bit but not so much outdated) step-by-step discussion on how to build some example fuzzers

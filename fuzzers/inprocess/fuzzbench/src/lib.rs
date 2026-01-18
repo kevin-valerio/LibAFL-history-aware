@@ -31,7 +31,8 @@ use libafl::{
     },
     observers::{CanTrack, HitcountsMapObserver, TimeObserver},
     schedulers::{
-        IndexesLenTimeMinimizerScheduler, StdWeightedScheduler, powersched::PowerSchedule,
+        GitAwareStdWeightedScheduler, GitRecencyMapMetadata, IndexesLenTimeMinimizerScheduler,
+        powersched::PowerSchedule,
     },
     stages::{
         ShadowTracingStage, StdMutationalStage, calibrate::CalibrationStage,
@@ -304,6 +305,10 @@ fn fuzz(
 
     println!("Let's fuzz :)");
 
+    if let Ok(mapping_path) = env::var("LIBAFL_GIT_RECENCY_MAPPING_PATH") {
+        state.add_metadata(GitRecencyMapMetadata::load_from_file(mapping_path)?);
+    }
+
     // The actual target run starts here.
     // Call LLVMFUzzerInitialize() if present.
     let args: Vec<String> = env::args().collect();
@@ -330,7 +335,7 @@ fn fuzz(
     // A minimization+queue policy to get testcasess from the corpus
     let scheduler = IndexesLenTimeMinimizerScheduler::new(
         &edges_observer,
-        StdWeightedScheduler::with_schedule(
+        GitAwareStdWeightedScheduler::with_schedule(
             &mut state,
             &edges_observer,
             Some(PowerSchedule::fast()),
