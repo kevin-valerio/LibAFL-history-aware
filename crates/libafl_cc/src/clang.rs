@@ -423,6 +423,15 @@ impl ToolWrapper for ClangWrapper {
             return Ok(args);
         }
 
+        // Keep `SanitizerCoverage` instrumentation placement stable, independent of whether we
+        // generate the git-recency mapping. Otherwise, just setting
+        // `LIBAFL_GIT_RECENCY_MAPPING_PATH` would change the coverage layout/guard count and make
+        // baseline vs git-aware comparisons meaningless.
+        if cfg!(feature = "git-recency") && !self.linking && !self.is_asm {
+            args.push("-mllvm".into());
+            args.push("--sanitizer-early-opt-ep".into());
+        }
+
         if cfg!(feature = "git-recency")
             && self.git_recency_mapping_out.is_some()
             && !self.linking
@@ -432,10 +441,6 @@ impl ToolWrapper for ClangWrapper {
                 .is_some_and(|p| p.ends_with(".o") || p.ends_with(".obj"))
         {
             use_pass = true;
-            // Ensure sanitizer/coverage instrumentation runs early enough so the
-            // git-recency pass can observe the final pc-guard sites.
-            args.push("-mllvm".into());
-            args.push("--sanitizer-early-opt-ep".into());
 
             let pass_path = LLVMPasses::GitRecency
                 .path()

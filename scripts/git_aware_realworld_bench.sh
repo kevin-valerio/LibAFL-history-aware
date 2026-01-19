@@ -92,7 +92,7 @@ EOF
 
 __attribute__((noinline))
 void libafl_recent_bug(const uint8_t *data, size_t size) {
-  if (size < 2) {
+  if (size == 0) {
     return;
   }
 
@@ -100,7 +100,7 @@ void libafl_recent_bug(const uint8_t *data, size_t size) {
     return;
   }
 
-  uint16_t v = ((uint16_t)data[size - 2] << 8) | (uint16_t)data[size - 1];
+  uint8_t v = data[size - 1];
   volatile uint32_t x = (uint32_t)v + 1U;
   (void)x;
 }
@@ -120,13 +120,13 @@ path = Path("libafl_recent_bug.c")
 src = path.read_text()
 
 src = src.replace(
-    "  uint16_t v = ((uint16_t)data[size - 2] << 8) | (uint16_t)data[size - 1];\n",
-    "  uint16_t v = (uint16_t)(((uint16_t)data[size - 2] << 8) | (uint16_t)data[size - 1]);\n",
+    "  uint8_t v = data[size - 1];\n",
+    "  uint8_t v = (uint8_t)data[size - 1];\n",
     1,
 )
 src = src.replace(
     "  volatile uint32_t x = (uint32_t)v + 1U;\n",
-    "  volatile uint32_t x = 0x12345678U / (uint32_t)(v - 0x1337U); // RECENT_BUG\n",
+    "  volatile uint32_t x = 0x12345678U / (uint32_t)(v - 0x42U); // RECENT_BUG\n",
     1,
 )
 
@@ -297,7 +297,7 @@ def run_pair(trial_idx: int):
         baseline_bin,
         "baseline",
         trial_idx,
-        {"LIBAFL_GIT_RECENCY_MAPPING_PATH": None},
+        {"LIBAFL_GIT_RECENCY_MAPPING_PATH": None, "LIBAFL_RAND_SEED": str(trial_idx)},
     )
     times["baseline"] = budget_secs if t is None else t
 
@@ -305,7 +305,10 @@ def run_pair(trial_idx: int):
         gitaware_bin,
         "gitaware",
         trial_idx,
-        {"LIBAFL_GIT_RECENCY_MAPPING_PATH": str(mapping_path)},
+        {
+            "LIBAFL_GIT_RECENCY_MAPPING_PATH": str(mapping_path),
+            "LIBAFL_RAND_SEED": str(trial_idx),
+        },
     )
     times["gitaware"] = budget_secs if t is None else t
 

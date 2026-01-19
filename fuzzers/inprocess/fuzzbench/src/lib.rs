@@ -286,9 +286,18 @@ fn fuzz(
 
     // If not restarting, create a State from scratch
     let mut state = state.unwrap_or_else(|| {
+        let rand = if let Ok(seed) = env::var("LIBAFL_RAND_SEED") {
+            StdRand::with_seed(
+                seed.parse::<u64>()
+                    .expect("LIBAFL_RAND_SEED must be a u64 integer"),
+            )
+        } else {
+            StdRand::new()
+        };
+
         StdState::new(
             // RNG
-            StdRand::new(),
+            rand,
             // Corpus that will be evolved, we keep it in memory for performance
             InMemoryOnDiskCorpus::new(corpus_dir).unwrap(),
             // Corpus in which we store solutions (crashes in this example),
@@ -304,7 +313,6 @@ fn fuzz(
     });
 
     println!("Let's fuzz :)");
-
     if let Ok(mapping_path) = env::var("LIBAFL_GIT_RECENCY_MAPPING_PATH") {
         state.add_metadata(GitRecencyMapMetadata::load_from_file(mapping_path)?);
     }

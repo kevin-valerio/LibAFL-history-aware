@@ -12,16 +12,22 @@ use object::{Object, ObjectSection};
 
 pub(crate) const GIT_RECENCY_MAPPING_ENV: &str = "LIBAFL_GIT_RECENCY_MAPPING_PATH";
 
-const SIDECAR_MAGIC: &[u8; 8] = b"LAFLGIT1";
+const SIDECAR_MAGIC_V1: &[u8; 8] = b"LAFLGIT1";
+const SIDECAR_MAGIC_V2: &[u8; 8] = b"LAFLGIT2";
 pub(crate) const SIDECAR_EXT: &str = "libafl_git_recency";
 
 const GITREC_SECTION_NAMES: &[&str] = &["libafl_gitrec", "__libafl_gitrec"];
 const SANCOV_GUARDS_SECTION_NAMES: &[&str] = &["__sancov_guards", ".sancov_guards"];
 
 #[derive(Debug, Clone)]
-struct SidecarEntry {
-    file: Option<String>,
+struct SidecarLoc {
+    file: String,
     line: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SidecarEntry {
+    locs: Vec<SidecarLoc>,
 }
 
 fn sidecar_path_for_object(obj: &Path) -> PathBuf {
@@ -235,10 +241,11 @@ fn parse_sidecar_stream(bytes: &[u8]) -> Result<Vec<SidecarEntry>, Error> {
                 "git recency sidecar truncated while reading header".to_string(),
             ));
         }
-        if &bytes[offset..offset + 8] != SIDECAR_MAGIC {
-            return Err(Error::Unknown(
-                "git recency sidecar magic mismatch".to_string(),
-            ));
+        let magic = &bytes[offset..offset + 8];
+        let is_v1 = magic == SIDECAR_MAGIC_V1;
+        let is_v2 = magic == SIDECAR_MAGIC_V2;
+        if !is_v1 && !is_v2 {
+            return Err(Error::Unknown("git recency sidecar magic mismatch".to_string()));
         }
 
         let len = read_u64_le(&bytes[offset + 8..offset + 16]);
@@ -247,33 +254,78 @@ fn parse_sidecar_stream(bytes: &[u8]) -> Result<Vec<SidecarEntry>, Error> {
         })?;
         offset += 16;
 
-        for _ in 0..len {
-            if offset + 8 > bytes.len() {
-                return Err(Error::Unknown(
-                    "git recency sidecar truncated while reading entry header".to_string(),
-                ));
+        if is_v1 {
+            for _ in 0..len {
+                if offset + 8 > bytes.len() {
+                    return Err(Error::Unknown(
+                        "git recency sidecar truncated while reading entry header".to_string(),
+                    ));
+                }
+                let line = read_u32_le(&bytes[offset..offset + 4]);
+                let path_len = read_u32_le(&bytes[offset + 4..offset + 8]) as usize;
+                offset += 8;
+
+                if offset + path_len > bytes.len() {
+                    return Err(Error::Unknown(
+                        "git recency sidecar truncated while reading path".to_string(),
+                    ));
+                }
+
+                let mut locs = Vec::new();
+                if line != 0 && path_len != 0 {
+                    let path_bytes = &bytes[offset..offset + path_len];
+                    let file = String::from_utf8(path_bytes.to_vec()).map_err(|e| {
+                        Error::Unknown(format!("git recency sidecar contains non-utf8 path: {e}"))
+                    })?;
+                    locs.push(SidecarLoc { file, line });
+                }
+                offset += path_len;
+
+                entries.push(SidecarEntry { locs });
             }
-            let line = read_u32_le(&bytes[offset..offset + 4]);
-            let path_len = read_u32_le(&bytes[offset + 4..offset + 8]) as usize;
-            offset += 8;
+        } else {
+            // v2: per-entry list of (path,line) debug locations.
+            for _ in 0..len {
+                if offset + 4 > bytes.len() {
+                    return Err(Error::Unknown(
+                        "git recency sidecar truncated while reading entry header".to_string(),
+                    ));
+                }
+                let nlocs = read_u32_le(&bytes[offset..offset + 4]) as usize;
+                offset += 4;
 
-            if offset + path_len > bytes.len() {
-                return Err(Error::Unknown(
-                    "git recency sidecar truncated while reading path".to_string(),
-                ));
+                let mut locs: Vec<SidecarLoc> = Vec::with_capacity(nlocs);
+                for _ in 0..nlocs {
+                    if offset + 8 > bytes.len() {
+                        return Err(Error::Unknown(
+                            "git recency sidecar truncated while reading location header"
+                                .to_string(),
+                        ));
+                    }
+                    let line = read_u32_le(&bytes[offset..offset + 4]);
+                    let path_len = read_u32_le(&bytes[offset + 4..offset + 8]) as usize;
+                    offset += 8;
+
+                    if offset + path_len > bytes.len() {
+                        return Err(Error::Unknown(
+                            "git recency sidecar truncated while reading path".to_string(),
+                        ));
+                    }
+
+                    if line != 0 && path_len != 0 {
+                        let path_bytes = &bytes[offset..offset + path_len];
+                        let file = String::from_utf8(path_bytes.to_vec()).map_err(|e| {
+                            Error::Unknown(format!(
+                                "git recency sidecar contains non-utf8 path: {e}"
+                            ))
+                        })?;
+                        locs.push(SidecarLoc { file, line });
+                    }
+                    offset += path_len;
+                }
+
+                entries.push(SidecarEntry { locs });
             }
-
-            let file = if line == 0 || path_len == 0 {
-                None
-            } else {
-                let path_bytes = &bytes[offset..offset + path_len];
-                Some(String::from_utf8(path_bytes.to_vec()).map_err(|e| {
-                    Error::Unknown(format!("git recency sidecar contains non-utf8 path: {e}"))
-                })?)
-            };
-            offset += path_len;
-
-            entries.push(SidecarEntry { file, line });
         }
     }
 
@@ -324,43 +376,36 @@ pub(crate) fn generate_git_recency_mapping(
         )));
     }
 
-    let mut resolved: Vec<Option<(String, u32)>> = Vec::with_capacity(entries.len());
+    let mut resolved: Vec<Vec<(String, u32)>> = Vec::with_capacity(entries.len());
     for entry in entries {
-        let Some(file) = entry.file else {
-            resolved.push(None);
-            continue;
-        };
+        let mut locs: Vec<(String, u32)> = Vec::new();
+        for loc in entry.locs {
+            if loc.line == 0 {
+                continue;
+            }
 
-        if entry.line == 0 {
-            resolved.push(None);
-            continue;
+            let p = PathBuf::from(loc.file);
+            let p = if p.is_absolute() { p } else { cwd.join(p) };
+            let Ok(p) = fs::canonicalize(&p) else {
+                continue;
+            };
+            if !p.starts_with(&repo_root) {
+                continue;
+            }
+
+            let rel = p.strip_prefix(&repo_root).unwrap();
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            locs.push((rel, loc.line));
         }
-
-        let p = PathBuf::from(file);
-        let p = if p.is_absolute() { p } else { cwd.join(p) };
-
-        let Ok(p) = fs::canonicalize(&p) else {
-            resolved.push(None);
-            continue;
-        };
-
-        if !p.starts_with(&repo_root) {
-            resolved.push(None);
-            continue;
-        }
-
-        let rel = p.strip_prefix(&repo_root).unwrap();
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        resolved.push(Some((rel, entry.line)));
+        locs.sort_unstable();
+        locs.dedup();
+        resolved.push(locs);
     }
 
     let mut needed_by_file: HashMap<String, HashSet<u32>> = HashMap::new();
-    for item in &resolved {
-        if let Some((file, line)) = item {
-            needed_by_file
-                .entry(file.clone())
-                .or_default()
-                .insert(*line);
+    for entry_locs in &resolved {
+        for (file, line) in entry_locs {
+            needed_by_file.entry(file.clone()).or_default().insert(*line);
         }
     }
 
@@ -371,18 +416,17 @@ pub(crate) fn generate_git_recency_mapping(
     }
 
     let mut timestamps: Vec<u64> = Vec::with_capacity(resolved.len());
-    for item in resolved {
-        let Some((file, line)) = item else {
-            timestamps.push(0);
-            continue;
-        };
-
-        let t = times_by_file
-            .get(&file)
-            .and_then(|m| m.get(&line))
-            .copied()
-            .unwrap_or(0);
-        timestamps.push(t);
+    for entry_locs in resolved {
+        let mut max_t = 0u64;
+        for (file, line) in entry_locs {
+            let t = times_by_file
+                .get(&file)
+                .and_then(|m| m.get(&line))
+                .copied()
+                .unwrap_or(0);
+            max_t = max_t.max(t);
+        }
+        timestamps.push(max_t);
     }
 
     let mut out = fs::File::create(mapping_out).map_err(Error::Io)?;
@@ -397,20 +441,20 @@ pub(crate) fn generate_git_recency_mapping(
 
 #[cfg(test)]
 mod tests {
-    use super::{SIDECAR_MAGIC, parse_sidecar, parse_sidecar_stream};
+    use super::{SIDECAR_MAGIC_V1, SIDECAR_MAGIC_V2, parse_sidecar, parse_sidecar_stream};
 
     #[test]
     fn test_parse_sidecar_empty() {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(SIDECAR_MAGIC);
+        bytes.extend_from_slice(SIDECAR_MAGIC_V2);
         bytes.extend_from_slice(&0u64.to_le_bytes());
         let entries = parse_sidecar(&bytes).unwrap();
         assert!(entries.is_empty());
     }
 
-    fn build_sidecar_blob(entries: &[(u32, Option<&str>)]) -> Vec<u8> {
+    fn build_sidecar_blob_v1(entries: &[(u32, Option<&str>)]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(SIDECAR_MAGIC);
+        bytes.extend_from_slice(SIDECAR_MAGIC_V1);
         bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
         for (line, path) in entries {
             bytes.extend_from_slice(&line.to_le_bytes());
@@ -424,10 +468,40 @@ mod tests {
         bytes
     }
 
+    fn build_sidecar_blob_v2(entries: &[&[(u32, Option<&str>)]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(SIDECAR_MAGIC_V2);
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for locs in entries {
+            bytes.extend_from_slice(&(locs.len() as u32).to_le_bytes());
+            for (line, path) in *locs {
+                bytes.extend_from_slice(&line.to_le_bytes());
+                if let Some(path) = path {
+                    bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+                    bytes.extend_from_slice(path.as_bytes());
+                } else {
+                    bytes.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_parse_sidecar_v1() {
+        let bytes = build_sidecar_blob_v1(&[(12, Some("a.c")), (0, None)]);
+        let entries = parse_sidecar(&bytes).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].locs.len(), 1);
+        assert_eq!(entries[0].locs[0].line, 12);
+        assert_eq!(entries[0].locs[0].file.as_str(), "a.c");
+        assert!(entries[1].locs.is_empty());
+    }
+
     #[test]
     fn test_parse_sidecar_stream_concat() {
-        let blob1 = build_sidecar_blob(&[(12, Some("a.c")), (0, None)]);
-        let blob2 = build_sidecar_blob(&[(7, Some("b.c"))]);
+        let blob1 = build_sidecar_blob_v2(&[&[(12, Some("a.c")), (0, None)], &[]]);
+        let blob2 = build_sidecar_blob_v2(&[&[(7, Some("b.c"))]]);
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&blob1);
@@ -435,11 +509,12 @@ mod tests {
 
         let entries = parse_sidecar_stream(&bytes).unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].line, 12);
-        assert_eq!(entries[0].file.as_deref(), Some("a.c"));
-        assert_eq!(entries[1].line, 0);
-        assert_eq!(entries[1].file.as_deref(), None);
-        assert_eq!(entries[2].line, 7);
-        assert_eq!(entries[2].file.as_deref(), Some("b.c"));
+        assert_eq!(entries[0].locs.len(), 1);
+        assert_eq!(entries[0].locs[0].line, 12);
+        assert_eq!(entries[0].locs[0].file.as_str(), "a.c");
+        assert!(entries[1].locs.is_empty());
+        assert_eq!(entries[2].locs.len(), 1);
+        assert_eq!(entries[2].locs[0].line, 7);
+        assert_eq!(entries[2].locs[0].file.as_str(), "b.c");
     }
 }

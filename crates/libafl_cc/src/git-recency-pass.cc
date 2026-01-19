@@ -34,12 +34,11 @@ static cl::opt<std::string> SidecarPath(
 namespace {
 
 static constexpr const char kMagic[8] = {'L', 'A', 'F', 'L',
-                                         'G', 'I', 'T', '1'};
+                                         'G', 'I', 'T', '2'};
 
 struct LocEntry {
   std::string path;
   uint32_t    line = 0;
-  bool        known = false;
 };
 
 static void write_u32_le(std::ofstream &out, uint32_t v) {
@@ -99,8 +98,8 @@ static const Function *called_function_stripped(const CallBase *CB) {
   return dyn_cast<Function>(V);
 }
 
-static DebugLoc find_last_non_instrumentation_debugloc(const BasicBlock &BB) {
-  DebugLoc last;
+static void append_debuglocs_for_bb(const BasicBlock &BB,
+                                   std::vector<LocEntry> &out) {
   for (const auto &I : BB) {
     if (isa<DbgInfoIntrinsic>(&I)) { continue; }
 
@@ -126,10 +125,40 @@ static DebugLoc find_last_non_instrumentation_debugloc(const BasicBlock &BB) {
     if (I.isTerminator()) { continue; }
 
     DebugLoc DL = I.getDebugLoc();
-    if (DL) { last = DL; }
+    if (!DL) { continue; }
+
+    const auto *Loc = DL.get();
+    if (!Loc) { continue; }
+    auto *File = Loc->getFile();
+    if (!File) { continue; }
+
+    std::string dir = File->getDirectory().str();
+    std::string fname = File->getFilename().str();
+    if (fname.empty()) { continue; }
+    uint32_t line = Loc->getLine();
+    if (line == 0) { continue; }
+
+    LocEntry E;
+    if (!dir.empty()) {
+      E.path = dir + "/" + fname;
+    } else {
+      E.path = fname;
+    }
+    E.line = line;
+    out.push_back(std::move(E));
   }
 
-  return last;
+  // Deterministic + deduplicated output per BB.
+  std::sort(out.begin(), out.end(),
+            [](const LocEntry &a, const LocEntry &b) {
+              if (a.path == b.path) { return a.line < b.line; }
+              return a.path < b.path;
+            });
+  out.erase(std::unique(out.begin(), out.end(),
+                        [](const LocEntry &a, const LocEntry &b) {
+                          return a.line == b.line && a.path == b.path;
+                        }),
+            out.end());
 }
 
 class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
@@ -140,7 +169,7 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
     //
     // We only record blocks that contain a trace-pc-guard hook call. This keeps
     // the emitted entry count aligned with the number of guards in the object.
-    std::vector<LocEntry> ordered;
+    std::vector<std::vector<LocEntry>> ordered;
     for (auto &F : M) {
       if (isIgnoreFunction(&F)) { continue; }
       for (auto &BB : F) {
@@ -157,27 +186,9 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
         }
         if (!has_trace_pc_guard) { continue; }
 
-        DebugLoc DL = find_last_non_instrumentation_debugloc(BB);
-
-        LocEntry E;
-        if (DL) {
-          const auto *Loc = DL.get();
-          if (Loc) {
-            if (auto *File = Loc->getFile()) {
-              std::string dir = File->getDirectory().str();
-              std::string fname = File->getFilename().str();
-              if (!dir.empty()) {
-                E.path = dir + "/" + fname;
-              } else {
-                E.path = fname;
-              }
-              E.line = Loc->getLine();
-              E.known = (!E.path.empty() && E.line != 0);
-            }
-          }
-        }
-
-        ordered.push_back(std::move(E));
+        std::vector<LocEntry> locs;
+        append_debuglocs_for_bb(BB, locs);
+        ordered.push_back(std::move(locs));
       }
     }
 
@@ -185,16 +196,13 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
     blob.insert(blob.end(), kMagic, kMagic + sizeof(kMagic));
     append_u64_le(blob, static_cast<uint64_t>(ordered.size()));
 
-    for (auto const &E : ordered) {
-      if (!E.known) {
-        append_u32_le(blob, 0);
-        append_u32_le(blob, 0);
-        continue;
+    for (auto const &locs : ordered) {
+      append_u32_le(blob, static_cast<uint32_t>(locs.size()));
+      for (auto const &E : locs) {
+        append_u32_le(blob, E.line);
+        append_u32_le(blob, static_cast<uint32_t>(E.path.size()));
+        blob.insert(blob.end(), E.path.begin(), E.path.end());
       }
-
-      append_u32_le(blob, E.line);
-      append_u32_le(blob, static_cast<uint32_t>(E.path.size()));
-      blob.insert(blob.end(), E.path.begin(), E.path.end());
     }
 
     // v1: sidecar file
