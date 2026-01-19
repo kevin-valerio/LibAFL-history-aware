@@ -78,11 +78,12 @@ static const Function *called_function_stripped(const CallBase *CB) {
   return dyn_cast<Function>(V);
 }
 
-static bool resolve_guard_ptr(Value *V, const GlobalVariable *&out_gv,
-                              uint64_t &out_idx) {
+static bool resolve_guard_ptr(Value *V, const DataLayout &DL,
+                              const GlobalVariable *&out_gv, uint64_t &out_idx) {
   if (!V) { return false; }
 
   Value *stripped = V->stripPointerCasts();
+
   if (auto *GEP = dyn_cast<GEPOperator>(stripped)) {
     Value *base = GEP->getPointerOperand()->stripPointerCasts();
     auto  *GV = dyn_cast<GlobalVariable>(base);
@@ -104,6 +105,73 @@ static bool resolve_guard_ptr(Value *V, const GlobalVariable *&out_gv,
     out_gv = GV;
     out_idx = 0;
     return true;
+  }
+
+  // Clang 18+ with opaque pointers may lower guard element pointers as:
+  //   inttoptr (add (ptrtoint @GV, const))  instead of a GEP.
+  //
+  // Decode: inttoptr(add(ptrtoint(GV), offset_bytes)) -> (GV, offset_bytes /
+  // elem_size).
+  if (auto *CE = dyn_cast<ConstantExpr>(stripped)) {
+    if (CE->getOpcode() == Instruction::IntToPtr) {
+      Value *inner = CE->getOperand(0);
+      const GlobalVariable *GV = nullptr;
+      uint64_t offset_bytes = 0;
+
+      auto decode_ptrtoint_gv = [&](Value *X, const GlobalVariable *&Out) {
+        if (auto *P2I = dyn_cast<ConstantExpr>(X)) {
+          if (P2I->getOpcode() != Instruction::PtrToInt) { return false; }
+          Value *P = P2I->getOperand(0)->stripPointerCasts();
+          Out = dyn_cast<GlobalVariable>(P);
+          return Out != nullptr;
+        }
+        return false;
+      };
+
+      if (auto *Add = dyn_cast<ConstantExpr>(inner)) {
+        if (Add->getOpcode() == Instruction::Add) {
+          Value *Op0 = Add->getOperand(0);
+          Value *Op1 = Add->getOperand(1);
+
+          const GlobalVariable *BaseGV = nullptr;
+          const ConstantInt    *Cst = nullptr;
+
+          if (auto *CI = dyn_cast<ConstantInt>(Op0)) {
+            Cst = CI;
+            if (!decode_ptrtoint_gv(Op1, BaseGV)) { return false; }
+          } else if (auto *CI = dyn_cast<ConstantInt>(Op1)) {
+            Cst = CI;
+            if (!decode_ptrtoint_gv(Op0, BaseGV)) { return false; }
+          } else {
+            return false;
+          }
+
+          GV = BaseGV;
+          offset_bytes = Cst->getZExtValue();
+        } else if (Add->getOpcode() == Instruction::PtrToInt) {
+          if (!decode_ptrtoint_gv(Add, GV)) { return false; }
+          offset_bytes = 0;
+        }
+      } else if (auto *P2I = dyn_cast<ConstantExpr>(inner)) {
+        if (P2I->getOpcode() == Instruction::PtrToInt) {
+          if (!decode_ptrtoint_gv(P2I, GV)) { return false; }
+          offset_bytes = 0;
+        }
+      }
+
+      if (!GV) { return false; }
+
+      Type *VT = GV->getValueType();
+      Type *ElemT = VT;
+      if (auto *AT = dyn_cast<ArrayType>(VT)) { ElemT = AT->getElementType(); }
+
+      uint64_t elem_size = DL.getTypeAllocSize(ElemT);
+      if (elem_size == 0 || (offset_bytes % elem_size) != 0) { return false; }
+
+      out_gv = GV;
+      out_idx = offset_bytes / elem_size;
+      return true;
+    }
   }
 
   return false;
@@ -150,6 +218,7 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
  public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
     if (SidecarPath.empty()) { return PreservedAnalyses::all(); }
+    const DataLayout &DLay = M.getDataLayout();
 
     std::unordered_map<const GlobalVariable *, std::vector<LocEntry>> entries;
     std::vector<const GlobalVariable *>                             guard_order;
@@ -168,7 +237,7 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
 
           const GlobalVariable *GV = nullptr;
           uint64_t              idx = 0;
-          if (!resolve_guard_ptr(CB->getArgOperand(0), GV, idx)) { continue; }
+          if (!resolve_guard_ptr(CB->getArgOperand(0), DLay, GV, idx)) { continue; }
 
           if (std::find(guard_order.begin(), guard_order.end(), GV) ==
               guard_order.end()) {
@@ -218,7 +287,7 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
 
           const GlobalVariable *GV = nullptr;
           uint64_t              guard_idx = 0;
-          if (!resolve_guard_ptr(CB->getArgOperand(0), GV, guard_idx)) {
+          if (!resolve_guard_ptr(CB->getArgOperand(0), DLay, GV, guard_idx)) {
             continue;
           }
 

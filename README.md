@@ -18,6 +18,76 @@ The mapping file format is:
 
 `u64 head_time` + `u64 len` + `len * u64 entries` (all little-endian).
 
+## Implementation details (how it is built)
+
+### Build step 1: record “index → source location” per object file
+
+When you compile with `libafl_cc` and you set `LIBAFL_GIT_RECENCY_MAPPING_PATH`, the wrapper loads an LLVM pass while compiling each object file.
+
+That pass looks for calls to SanitizerCoverage’s pc-guard hook (`__sanitizer_cov_trace_pc_guard`).
+For each call, it tries to find a debug location (`file:line`) for the basic block.
+To avoid blaming sanitizer/instrumentation code, it looks for the first “real” instruction in the same basic block that has a valid debug location, and uses that one.
+
+It writes a small sidecar file next to the object file:
+
+`<object>.libafl_git_recency`
+
+This sidecar is a list in pc-guard order for that object:
+each entry is either `file:line` or “unknown”.
+
+Internally, the pass resolves the guard pointer argument back to the guard global (and element index) so it can store the location at the right position in the per-object list.
+
+### Build step 2: merge objects at link time, then run `git blame`
+
+At the final link step, the `libafl_cc` wrapper reads all those sidecar files (for each `.o` on the link line), merges them in the same order, and turns `file:line` into a timestamp using `git blame --line-porcelain`.
+
+We also store the `HEAD` commit time at build time in the file (`head_time`).
+This makes the “age” computation stable for a given build.
+
+If a location cannot be mapped (no debug info, file not in the git repo, blame fails), it is treated as “old” and gets timestamp `0`.
+
+To avoid blaming system headers or external code, the link step only blames files that are inside the current git repo root.
+
+### Runtime: how the scheduler uses the mapping
+
+At fuzzer startup, you load the mapping file into `GitRecencyMapMetadata`.
+
+Then `GitRecencyTestcaseScore` wraps the normal weighted score (`CorpusWeightTestcaseScore`) and applies a boost.
+For each testcase, it looks at the list of covered map indexes stored in `MapIndexesMetadata` (this is why you must call `.track_indices()` on the map observer).
+
+It computes a cached value:
+
+`tc_time = max(entries[idx])` for all covered `idx`
+
+Then it boosts the testcase weight like this:
+
+`final = base * (1 + alpha * decay)`
+
+The decay is exponential with a fixed half-life of 14 days:
+
+`decay = 2^(-(head_time - tc_time) / half_life)`
+
+`alpha` controls how strong the bias is (default is `2.0`).
+
+To keep runtime overhead low, `tc_time` is computed once per testcase and cached inside `GitRecencyTestcaseMetadata`.
+
+### “How do we know the runtime map index matches the .bin entry?”
+
+This only works because the mapping uses the same index that the target uses at runtime.
+
+With SanitizerCoverage `trace-pc-guard`, each instrumented site has a “guard” variable.
+At startup, `__sanitizer_cov_trace_pc_guard_init` assigns each guard a unique number (0, 1, 2, …).
+`libafl_targets` then uses that number directly as the index into the coverage map.
+
+So the “basic block ID” you see in `MapIndexesMetadata` is the same number that was written into the guard, and the mapping file stores `entries[that_number]`.
+
+The tricky part is ordering.
+The runtime assigns those numbers by walking each object’s guard array, and doing that for all objects.
+This implementation makes the build-time merge match that order by writing the sidecar in the same order as the object’s guard array, and concatenating sidecars in the order the object files appear on the final link command.
+
+That is why we currently refuse `.a` archives for mapping generation: archive extraction/link order can change the effective order and would make the vector misaligned.
+Also, this expects plain pc-guard indexing. If you enable instrumentation modes that transform the index (like n-gram or ctx modes), the map index is no longer the raw guard value, and the mapping will not line up.
+
 ## How to use it
 
 ### 1) Build your target and generate the mapping
