@@ -9,6 +9,31 @@ The main goal is simple: keep coverage-guided fuzzing, but also prefer testcases
 It adds an opt-in scheduler score that boosts testcases which cover recently changed lines.
 “Recent” means the last commit time from `git blame` (`%ct`, epoch seconds).
 
+## When to use
+
+This is most useful when your target is under active development and you want to find regressions in recently changed code faster (for example: fuzzing a PR, a release branch, or after a refactor).
+
+Another good workflow is for **large codebases with big seed corpora**: run your normal coverage-guided harness until the corpus is “stable” (diminishing returns), then switch on the git-aware scheduler and restart the fuzzer using the *same corpus*. That way, scheduling effort shifts toward inputs that hit *recently changed lines*, which is a nice fit for continuous audit / code review and helps avoid spending most cycles on code last touched years ago.
+
+To enable it in an existing harness, the minimal additions look like:
+
+```rust
+let edges_observer = StdMapObserver::owned("edges", vec![0u8; 65536]).track_indices();
+
+state.add_metadata(GitRecencyMapMetadata::load_from_file("git_recency_map.bin")?);
+state.add_metadata(GitRecencyConfigMetadata::new(2.0)); // optional, default is 2.0
+
+let scheduler = GitAwareStdWeightedScheduler::new(&mut state, &edges_observer);
+```
+
+Best practices:
+- Commit the changes you care about before building (recency comes from `git blame`).
+- Rebuild the target and regenerate the mapping whenever `HEAD` changes.
+- Keep `alpha` modest (start with the default `2.0`) and consider alternating baseline and git-aware runs if you also care about long-horizon exploration.
+- For continuous audit/code review, keep a long-running baseline fuzzer, and spin up a git-aware run on each new commit/PR (same harness + same corpus, new build + new mapping).
+
+Recommendation: enable the git-aware scheduler for “fresh change” fuzzing, and keep a baseline run in parallel for broad coverage.
+
 ## How it works
 
 At build time, `libafl_cc` creates a mapping from SanitizerCoverage `trace-pc-guard` map indexes to `git blame` timestamps.
@@ -109,6 +134,37 @@ make CC="$CC" CXX="$CXX" -j"$(nproc)"
 Notes: you must use `-fsanitize-coverage=trace-pc-guard` and have debug info (`-g`) so coverage sites can be mapped to `file:line`.
 Instrumented `.a` archives are supported for mapping generation, as long as they were built with the `libafl_cc` wrappers so the embedded metadata is available in the final linked output.
 
+### 1b) Rust in-process fuzzing (libFuzzer-style)
+
+If your fuzz target is a Rust in-process fuzzer binary, you can instrument it with SanitizerCoverage `trace-pc-guard` plus the git-recency LLVM plugin, then generate the mapping from the resulting binary. This requires nightly (or `RUSTC_BOOTSTRAP=1`) because `-Zllvm-plugins` is unstable.
+
+```sh
+# Build the pass plugin + mapgen tool (in this repo)
+LLVM_CONFIG=llvm-config-20 cargo build -p libafl_cc --release
+
+# Build your fuzzer binary (in the target repo you want to `git blame`)
+plugin="$(find /path/to/LibAFL-git-aware/target/release -name 'git-recency-pass.so' -type f | head -n 1)"
+
+rustflags=(
+  "-Cdebuginfo=1"
+  "-Cpasses=sancov-module libafl-git-recency"
+  "-Cllvm-args=--sanitizer-coverage-level=3"
+  "-Cllvm-args=--sanitizer-coverage-trace-pc-guard"
+  "-Zllvm-plugins=${plugin}"
+)
+
+CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; echo "${rustflags[*]}")" \
+RUSTC_BOOTSTRAP=1 \
+cargo build --release -p <your-fuzzer-crate>
+
+# Generate the mapping for the produced binary (run from the target repo root)
+/path/to/LibAFL-git-aware/target/release/libafl_git_recency_mapgen \
+  --out git_recency_map.bin \
+  --bin target/release/<your-fuzzer-binary>
+```
+
+Then load `git_recency_map.bin` in your fuzzer state and use the git-aware scheduler (next section). For a complete working example, see `scripts/git_aware_reth_bench.sh`.
+
 ### 2) Use the git-aware scheduler
 
 Enable index tracking on your map observer (`.track_indices()`), load the mapping file into state, then use the git-aware weighted scheduler.
@@ -154,6 +210,24 @@ Time to find the introduced bug with `bash scripts/git_aware_reth_bench.sh --tri
 | 3     | 31.772     | 124.470    | baseline |
 | 4     | 44.089     | 13.072     | git-aware |
 | 5     | 211.480    | 27.938     | git-aware |
+
+### Benchmark 2
+
+Time to find the introduced bug with `bash scripts/git_aware_reth_bench.sh --trials 10  --budget 6000 --input-corpus /tmp/libafl_gitaware_reth_bench.bynvh6UT/warmup/out/queue/`
+
+| trial | baseline_s | git-aware_s | winner   |
+|-------|------------|------------|----------|
+| 1     | 107.443    | 52.267     | git-aware |
+| 2     | 86.076     | 60.382     | git-aware |
+| 3     | 31.772     | 124.470    | baseline |
+| 4     | 44.089     | 13.072     | git-aware |
+| 5     | 211.480    | 27.938     | git-aware |
+| 6     | 211.480    | 27.938     | git-aware |
+| 7     | 211.480    | 27.938     | git-aware |
+| 8     | 211.480    | 27.938     | git-aware |
+| 9     | 211.480    | 27.938     | git-aware |
+| 10     | 211.480    | 27.938     | git-aware |
+
 
 ## License
 
