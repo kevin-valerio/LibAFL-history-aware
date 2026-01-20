@@ -145,7 +145,7 @@ This benchmark creates a temporary `reth` git checkout under `/tmp`, adds a smal
 
 ### Benchmark 1
 
-Time to find the introduced bug
+Time to find the introduced bug with `bash scripts/git_aware_reth_bench.sh --trials 5 --warmup 3600 --budget 3600`
 
 | trial | baseline_s | git-aware_s | winner   |
 |-------|------------|------------|----------|
