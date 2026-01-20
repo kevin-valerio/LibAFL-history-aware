@@ -164,33 +164,32 @@ static void append_debuglocs_for_bb(const BasicBlock &BB,
 class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
  public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
-    if (SidecarPath.empty()) { return PreservedAnalyses::all(); }
     // Collect source locations for each *instrumented* basic block.
     //
-    // We only record blocks that contain a trace-pc-guard hook call. This keeps
-    // the emitted entry count aligned with the number of guards in the object.
+    // We record one entry for each `__sanitizer_cov_trace_pc_guard` call. This keeps
+    // the emitted entry count aligned with the number of guards in the object even
+    // if multiple trace calls end up in a single basic block.
     std::vector<std::vector<LocEntry>> ordered;
     for (auto &F : M) {
-      if (isIgnoreFunction(&F)) { continue; }
+      if (is_sancov_trace_function(F.getName()) ||
+          is_sancov_init_function(F.getName())) {
+        continue;
+      }
       for (auto &BB : F) {
-        bool has_trace_pc_guard = false;
         for (auto const &I : BB) {
           auto *CB = dyn_cast<CallBase>(&I);
           if (!CB) { continue; }
           if (auto *Callee = called_function_stripped(CB)) {
-            if (is_sancov_trace_function(Callee->getName())) {
-              has_trace_pc_guard = true;
-              break;
-            }
+            if (!is_sancov_trace_function(Callee->getName())) { continue; }
+            std::vector<LocEntry> locs;
+            append_debuglocs_for_bb(BB, locs);
+            ordered.push_back(std::move(locs));
           }
         }
-        if (!has_trace_pc_guard) { continue; }
-
-        std::vector<LocEntry> locs;
-        append_debuglocs_for_bb(BB, locs);
-        ordered.push_back(std::move(locs));
       }
     }
+
+    if (ordered.empty()) { return PreservedAnalyses::all(); }
 
     std::vector<uint8_t> blob;
     blob.insert(blob.end(), kMagic, kMagic + sizeof(kMagic));
@@ -205,15 +204,17 @@ class GitRecencyPass : public PassInfoMixin<GitRecencyPass> {
       }
     }
 
-    // v1: sidecar file
-    std::ofstream out(SidecarPath, std::ios::binary | std::ios::out);
-    if (!out.is_open()) {
-      FATAL("Could not open git recency sidecar for writing: %s\n",
-            SidecarPath.c_str());
+    // v1: sidecar file (optional)
+    if (!SidecarPath.empty()) {
+      std::ofstream out(SidecarPath, std::ios::binary | std::ios::out);
+      if (!out.is_open()) {
+        FATAL("Could not open git recency sidecar for writing: %s\n",
+              SidecarPath.c_str());
+      }
+      out.write(reinterpret_cast<const char *>(blob.data()),
+                static_cast<std::streamsize>(blob.size()));
+      out.close();
     }
-    out.write(reinterpret_cast<const char *>(blob.data()),
-              static_cast<std::streamsize>(blob.size()));
-    out.close();
 
     // v2: embedded section (supports static archives at link time)
     auto &Ctx = M.getContext();
@@ -242,6 +243,16 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
 llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "GitRecencyPass", "v0.1",
           [](PassBuilder &PB) {
+            PB.registerPipelineParsingCallback(
+                [](StringRef Name, ModulePassManager &MPM,
+                   ArrayRef<PassBuilder::PipelineElement> Pipeline) {
+                  (void)Pipeline;
+                  if (Name == "libafl-git-recency") {
+                    MPM.addPass(GitRecencyPass());
+                    return true;
+                  }
+                  return false;
+                });
             PB.registerOptimizerLastEPCallback(
                 [](ModulePassManager &MPM, OptimizationLevel OL
 #if LLVM_VERSION_MAJOR >= 20

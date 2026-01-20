@@ -391,6 +391,11 @@ pub const LIBAFL_CC_LLVM_VERSION: Option<usize> = None;
         exec_llvm_config(&["--cxxflags"])
     };
     let mut cxxflags: Vec<String> = cxxflags.split_whitespace().map(String::from).collect();
+    // Rust's LLVM is commonly built without RTTI. We also build our pass plugins without RTTI so
+    // they can be loaded via `rustc -Z llvm-plugins=...` for Rust targets.
+    if !cxxflags.iter().any(|f| f == "-fno-rtti") {
+        cxxflags.push("-fno-rtti".to_string());
+    }
 
     let edge_map_default_size: usize = option_env!("LIBAFL_EDGES_MAP_DEFAULT_SIZE")
         .map_or(Ok(65_536), str::parse)

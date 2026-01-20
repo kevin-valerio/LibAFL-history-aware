@@ -332,7 +332,11 @@ fn parse_sidecar_stream(bytes: &[u8]) -> Result<Vec<SidecarEntry>, Error> {
     Ok(entries)
 }
 
-pub(crate) fn generate_git_recency_mapping(
+/// Generate a git-recency mapping file (`pcguard_index -> git blame timestamp`) for a linked binary.
+///
+/// This is the same logic the `libafl_cc` wrapper runs at link time when
+/// `LIBAFL_GIT_RECENCY_MAPPING_PATH` is set.
+pub fn generate_git_recency_mapping(
     mapping_out: &Path,
     link_output: &Path,
     object_files: &[PathBuf],
