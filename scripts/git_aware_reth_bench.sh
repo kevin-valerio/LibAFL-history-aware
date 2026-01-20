@@ -18,9 +18,10 @@ DEFAULT_RUST_TOOLCHAIN="1.90.0"
 #  4) Build the baseline binary with:
 #       - SanitizerCoverage trace-pc-guard edges
 #       - LibAFL git-recency LLVM plugin (records debug locations for pcguard indices)
-#  5) Warmup: run the baseline binary for --warmup seconds (mapping disabled) to generate an initial
-#     corpus in $bench_root/warmup/out/queue. This reduces variance by avoiding "startup exploration"
-#     dominating the results, and ensures both variants start from identical inputs.
+#  5) Warmup (optional): run the baseline binary for --warmup seconds (mapping disabled) to generate
+#     an initial corpus in $bench_root/warmup/out/queue. This reduces variance by avoiding "startup
+#     exploration" dominating the results, and ensures both variants start from identical inputs.
+#     If you already have a corpus, pass --input-corpus DIR to skip warmup.
 #  6) Introduce a new commit that flips a single line to crash (marked "RECENT_BUG") and rebuild.
 #     Because it's a new commit, `git blame` will mark that line as "recent".
 #  7) Generate the `pcguard_index -> git blame timestamp` mapping file for the rebuilt binary.
@@ -38,7 +39,7 @@ DEFAULT_RUST_TOOLCHAIN="1.90.0"
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/git_aware_reth_bench.sh [--trials N] [--budget SECS] [--warmup SECS] [--bench-root DIR]
+  scripts/git_aware_reth_bench.sh [--trials N] [--budget SECS] [--warmup SECS] [--input-corpus DIR] [--bench-root DIR]
 EOF
   cat <<EOF
 
@@ -46,6 +47,7 @@ Defaults:
   --trials     ${DEFAULT_TRIALS}
   --budget     ${DEFAULT_BUDGET_SECS}
   --warmup     ${DEFAULT_WARMUP_SECS}
+  --input-corpus (unset; run warmup to generate one)
   --bench-root \$BENCH_ROOT or a mktemp dir under /tmp
   RUST_TOOLCHAIN=\$RUST_TOOLCHAIN or ${DEFAULT_RUST_TOOLCHAIN}
 EOF
@@ -67,6 +69,13 @@ How warmup works:
   - The resulting queue corpus directory:
       $bench_root/warmup/out/queue
     is then used as the input corpus for all trials.
+
+Using an existing corpus:
+  - Pass --input-corpus DIR to skip warmup and use DIR as the input corpus for all trials.
+  - If you previously ran this script with the default mktemp bench root, the warmup corpus is at:
+      /tmp/libafl_gitaware_reth_bench.XXXXXXXX/warmup/out/queue
+    next to the initial seeds at:
+      /tmp/libafl_gitaware_reth_bench.XXXXXXXX/in
 
 How trials work:
   - After warmup, the script commits a single-line crash marked "RECENT_BUG" and rebuilds.
@@ -1036,6 +1045,7 @@ main() {
   local trials="${DEFAULT_TRIALS}"
   local budget_secs="${DEFAULT_BUDGET_SECS}"
   local warmup_secs="${DEFAULT_WARMUP_SECS}"
+  local input_corpus=""
   local bench_root=""
 
   while [[ $# -gt 0 ]]; do
@@ -1054,6 +1064,10 @@ main() {
         ;;
       --warmup)
         warmup_secs="${2:-}"
+        shift 2
+        ;;
+      --input-corpus)
+        input_corpus="${2:-}"
         shift 2
         ;;
       --bench-root)
@@ -1078,6 +1092,14 @@ main() {
   fi
   bench_root="$(cd "${bench_root}" && pwd)"
 
+  if [[ -n "${input_corpus}" ]]; then
+    if [[ ! -d "${input_corpus}" ]]; then
+      echo "Input corpus dir does not exist: ${input_corpus}" >&2
+      exit 2
+    fi
+    input_corpus="$(cd "${input_corpus}" && pwd)"
+  fi
+
   ensure_host_deps
 
   local libafl_root
@@ -1089,18 +1111,23 @@ main() {
   init_bench_repo "${bench_root}"
   write_seeds "${bench_root}"
 
-  # Baseline snapshot: build once and generate a stable-ish corpus to start from.
-  # This warmup run is intentionally done before we introduce the crashing line, so it doesn't
-  # terminate early and skew the starting corpus.
-  local seed_dir="${bench_root}/in"
-  local baseline_bin
-  baseline_bin="$(build_bench_fuzzer "${bench_root}" "${tools_dir}")"
-  if [[ ! -x "${baseline_bin}" ]]; then
-    echo "Baseline fuzzer binary not found: ${baseline_bin}" >&2
-    exit 1
+  local warm_corpus=""
+  if [[ -n "${input_corpus}" ]]; then
+    warm_corpus="${input_corpus}"
+  else
+    # Baseline snapshot: build once and generate a stable-ish corpus to start from.
+    # This warmup run is intentionally done before we introduce the crashing line, so it doesn't
+    # terminate early and skew the starting corpus.
+    local seed_dir="${bench_root}/in"
+    local baseline_bin
+    baseline_bin="$(build_bench_fuzzer "${bench_root}" "${tools_dir}")"
+    if [[ ! -x "${baseline_bin}" ]]; then
+      echo "Baseline fuzzer binary not found: ${baseline_bin}" >&2
+      exit 1
+    fi
+    run_warmup "${bench_root}" "${baseline_bin}" "${seed_dir}" "${warmup_secs}"
+    warm_corpus="${bench_root}/warmup/out/queue"
   fi
-  run_warmup "${bench_root}" "${baseline_bin}" "${seed_dir}" "${warmup_secs}"
-  local warm_corpus="${bench_root}/warmup/out/queue"
 
   # Now introduce the "recent" bug line and rebuild.
   introduce_recent_bug_commit "${bench_root}/reth"
