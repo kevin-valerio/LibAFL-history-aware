@@ -754,6 +754,7 @@ run_trials() {
   python3 - <<PY
 import os
 import signal
+import math
 import statistics
 import subprocess
 import time
@@ -847,31 +848,186 @@ def run_one(variant: str, trial_idx: int, use_mapping: bool) -> float | None:
 
 def run_variant(name: str, use_mapping: bool):
     times = []
-    found = 0
+    found_flags = []
     for i in range(1, trials + 1):
         t = run_one(name, i, use_mapping)
         if t is None:
             times.append(budget_secs)
+            found_flags.append(False)
         else:
-            found += 1
             times.append(t)
-    return times, found
+            found_flags.append(True)
+    return times, found_flags
 
-baseline_times, baseline_found = run_variant("baseline", False)
-gitaware_times, gitaware_found = run_variant("git-aware", True)
+baseline_times, baseline_found_flags = run_variant("baseline", False)
+gitaware_times, gitaware_found_flags = run_variant("git-aware", True)
+
+def _pct(values: list[float], p: float) -> float:
+    if not values:
+        return float("nan")
+    values = sorted(values)
+    if len(values) == 1:
+        return values[0]
+    x = (len(values) - 1) * p
+    lo = int(math.floor(x))
+    hi = int(math.ceil(x))
+    if lo == hi:
+        return values[lo]
+    frac = x - lo
+    return values[lo] + (values[hi] - values[lo]) * frac
+
+def _stats(times: list[float]) -> dict[str, float]:
+    return {
+        "min": min(times),
+        "p25": _pct(times, 0.25),
+        "median": statistics.median(times),
+        "mean": statistics.mean(times),
+        "p75": _pct(times, 0.75),
+        "max": max(times),
+        "std": statistics.pstdev(times) if times else float("nan"),
+    }
+
+def _fmt_f64(v: float) -> str:
+    if math.isnan(v):
+        return "n/a"
+    return f"{v:.3f}"
+
+def _render_table(headers: list[str], rows: list[list[str]], right_align_cols: set[int]) -> str:
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    out_lines = []
+    header_cells = []
+    for i, h in enumerate(headers):
+        header_cells.append(h.rjust(widths[i]) if i in right_align_cols else h.ljust(widths[i]))
+    out_lines.append("  " + "  ".join(header_cells))
+
+    sep_cells = ["-" * w for w in widths]
+    out_lines.append("  " + "  ".join(sep_cells))
+
+    for row in rows:
+        cells = []
+        for i, cell in enumerate(row):
+            cells.append(cell.rjust(widths[i]) if i in right_align_cols else cell.ljust(widths[i]))
+        out_lines.append("  " + "  ".join(cells))
+    return "\n".join(out_lines)
+
+baseline_found = sum(baseline_found_flags)
+gitaware_found = sum(gitaware_found_flags)
+
+baseline_s = _stats(baseline_times)
+gitaware_s = _stats(gitaware_times)
+
+def _success_pct(found: int) -> float:
+    return (100.0 * found / trials) if trials else 0.0
+
+summary_rows = [
+    [
+        "baseline",
+        f"{baseline_found}/{trials}",
+        f"{_success_pct(baseline_found):.1f}%",
+        _fmt_f64(baseline_s["median"]),
+        _fmt_f64(baseline_s["mean"]),
+        _fmt_f64(baseline_s["p25"]),
+        _fmt_f64(baseline_s["p75"]),
+        _fmt_f64(baseline_s["std"]),
+        _fmt_f64(baseline_s["min"]),
+        _fmt_f64(baseline_s["max"]),
+    ],
+    [
+        "git-aware",
+        f"{gitaware_found}/{trials}",
+        f"{_success_pct(gitaware_found):.1f}%",
+        _fmt_f64(gitaware_s["median"]),
+        _fmt_f64(gitaware_s["mean"]),
+        _fmt_f64(gitaware_s["p25"]),
+        _fmt_f64(gitaware_s["p75"]),
+        _fmt_f64(gitaware_s["std"]),
+        _fmt_f64(gitaware_s["min"]),
+        _fmt_f64(gitaware_s["max"]),
+    ],
+]
 
 print("")
-print("Results (time-to-first-crash)")
+print("Benchmark results (time-to-first-crash)")
 print("")
-print("  Definition: wall-clock seconds from fuzzer start until the first crash file")
-print("              appears in the output 'crashes' dir.")
+print(f"  Bench root: {bench_root}")
+print(f"  Fuzzer bin: {fuzzer_bin}")
+print(f"  Input corpus: {in_dir}")
+print(f"  Mapping file: {mapping_path}")
+print("")
+print("  Definition: wall-clock seconds from fuzzer start until the first crash file appears in")
+print("              the output 'crashes' dir.")
 print("  Note: if no crash is found within the budget, that trial counts as 'budget' seconds.")
 print(f"  Trials: {trials}")
 print(f"  Budget: {budget_secs:.2f}s")
 print("")
-print("  Variant    median_s  found/trials")
-print(f"  baseline   {statistics.median(baseline_times):7.3f}  {baseline_found}/{trials}")
-print(f"  git-aware  {statistics.median(gitaware_times):7.3f}  {gitaware_found}/{trials}")
+
+print("Summary (timeouts are capped to budget seconds):")
+print(
+    _render_table(
+        headers=[
+            "variant",
+            "found",
+            "success",
+            "median_s",
+            "mean_s",
+            "p25_s",
+            "p75_s",
+            "std_s",
+            "min_s",
+            "max_s",
+        ],
+        rows=summary_rows,
+        right_align_cols=set(range(1, 10)),
+    )
+)
+
+baseline_med = baseline_s["median"]
+gitaware_med = gitaware_s["median"]
+delta_med = baseline_med - gitaware_med
+speedup = (baseline_med / gitaware_med) if gitaware_med > 0 else float("inf")
+
+wins = ties = losses = 0
+for b, g in zip(baseline_times, gitaware_times, strict=True):
+    if g < b:
+        wins += 1
+    elif g > b:
+        losses += 1
+    else:
+        ties += 1
+
+print("")
+print("Paired comparison (by seed, lower is better):")
+print(f"  Wins/ties/losses (git-aware vs baseline): {wins}/{ties}/{losses}")
+print(f"  Median delta (baseline - git-aware): {delta_med:.3f}s")
+print(f"  Median speedup factor: {speedup:.3f}x")
+
+if trials <= 50:
+    print("")
+    print("Per-trial breakdown (capped at budget on timeout):")
+    per_rows = []
+    for i, (b, b_ok, g, g_ok) in enumerate(
+        zip(baseline_times, baseline_found_flags, gitaware_times, gitaware_found_flags, strict=True),
+        start=1,
+    ):
+        b_cell = f"{b:.3f}" if b_ok else "timeout"
+        g_cell = f"{g:.3f}" if g_ok else "timeout"
+        winner = "git-aware" if g < b else ("baseline" if b < g else "tie")
+        per_rows.append([str(i), b_cell, g_cell, winner])
+
+    print(
+        _render_table(
+            headers=["trial", "baseline_s", "git-aware_s", "winner"],
+            rows=per_rows,
+            right_align_cols={0, 1, 2},
+        )
+    )
+else:
+    print("")
+    print(f"Per-trial breakdown omitted (trials={trials}; set <= 50 to print).")
 print("")
 PY
 }
