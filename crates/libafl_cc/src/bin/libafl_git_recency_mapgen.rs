@@ -14,7 +14,6 @@ fn main() {
         match arg.as_str() {
             "--out" => mapping_out = Some(args.next().unwrap_or_else(|| usage()).into()),
             "--bin" => bin = Some(args.next().unwrap_or_else(|| usage()).into()),
-            "-h" | "--help" => usage(),
             _ => usage(),
         }
     }
@@ -28,4 +27,3 @@ fn main() {
         process::exit(1);
     }
 }
-

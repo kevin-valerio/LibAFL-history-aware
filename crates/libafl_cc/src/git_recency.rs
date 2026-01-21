@@ -182,9 +182,7 @@ fn blame_times_for_lines(
     Ok(res)
 }
 
-fn read_gitrec_and_guard_counts(
-    link_output: &Path,
-) -> Result<(Option<Vec<u8>>, usize), Error> {
+fn read_gitrec_and_guard_counts(link_output: &Path) -> Result<(Option<Vec<u8>>, usize), Error> {
     let bytes = fs::read(link_output).map_err(Error::Io)?;
     let obj = object::File::parse(&*bytes).map_err(|e| {
         Error::Unknown(format!(
@@ -202,7 +200,7 @@ fn read_gitrec_and_guard_counts(
             continue;
         };
 
-        if GITREC_SECTION_NAMES.iter().any(|n| *n == name) {
+        if GITREC_SECTION_NAMES.contains(&name) {
             let data = section.uncompressed_data().map_err(|e| {
                 Error::Unknown(format!(
                     "failed to read section '{name}' from '{}': {e}",
@@ -213,7 +211,7 @@ fn read_gitrec_and_guard_counts(
             saw_gitrec = true;
         }
 
-        if SANCOV_GUARDS_SECTION_NAMES.iter().any(|n| *n == name) {
+        if SANCOV_GUARDS_SECTION_NAMES.contains(&name) {
             guard_bytes_total = guard_bytes_total.saturating_add(section.size());
         }
     }
@@ -245,7 +243,9 @@ fn parse_sidecar_stream(bytes: &[u8]) -> Result<Vec<SidecarEntry>, Error> {
         let is_v1 = magic == SIDECAR_MAGIC_V1;
         let is_v2 = magic == SIDECAR_MAGIC_V2;
         if !is_v1 && !is_v2 {
-            return Err(Error::Unknown("git recency sidecar magic mismatch".to_string()));
+            return Err(Error::Unknown(
+                "git recency sidecar magic mismatch".to_string(),
+            ));
         }
 
         let len = read_u64_le(&bytes[offset + 8..offset + 16]);
@@ -409,7 +409,10 @@ pub fn generate_git_recency_mapping(
     let mut needed_by_file: HashMap<String, HashSet<u32>> = HashMap::new();
     for entry_locs in &resolved {
         for (file, line) in entry_locs {
-            needed_by_file.entry(file.clone()).or_default().insert(*line);
+            needed_by_file
+                .entry(file.clone())
+                .or_default()
+                .insert(*line);
         }
     }
 

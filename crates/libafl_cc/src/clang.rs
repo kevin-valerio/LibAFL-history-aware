@@ -436,9 +436,11 @@ impl ToolWrapper for ClangWrapper {
             && self.git_recency_mapping_out.is_some()
             && !self.linking
             && !self.is_asm
-            && output_for_sidecar
-                .as_ref()
-                .is_some_and(|p| p.ends_with(".o") || p.ends_with(".obj"))
+            && output_for_sidecar.as_ref().is_some_and(|p| {
+                Path::new(p).extension().is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("o") || ext.eq_ignore_ascii_case("obj")
+                })
+            })
         {
             use_pass = true;
 
@@ -589,10 +591,15 @@ impl ToolWrapper for ClangWrapper {
                     if arg.starts_with('-') || arg.starts_with('@') {
                         continue;
                     }
-                    if arg.ends_with(".a") {
+                    if Path::new(arg)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("a"))
+                    {
                         continue;
                     }
-                    if arg.ends_with(".o") || arg.ends_with(".obj") {
+                    if Path::new(arg).extension().is_some_and(|ext| {
+                        ext.eq_ignore_ascii_case("o") || ext.eq_ignore_ascii_case("obj")
+                    }) {
                         object_files.push(PathBuf::from(arg));
                     }
                 }
