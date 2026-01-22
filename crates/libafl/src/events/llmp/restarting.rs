@@ -234,7 +234,7 @@ where
     #[cfg(unix)]
     let mut restarting_mgr = restarting_mgr;
     #[cfg(unix)]
-    restarting_mgr.fork(true);
+    restarting_mgr.fork(false);
 
     crate::events::restarting::setup_generic_restarting_mgr(
         restarting_mgr,

@@ -7,22 +7,22 @@ use libafl_bolts::core_affinity::CoreId;
 #[cfg(all(unix, not(miri)))]
 use libafl_bolts::os::unix_signals::setup_signal_handler;
 #[cfg(unix)]
-use libafl_bolts::os::{ForkResult, fork};
+use libafl_bolts::os::{fork, ForkResult};
 use libafl_bolts::{
-    os::{CTRL_C_EXIT, startable_self},
+    os::{startable_self, CTRL_C_EXIT},
     shmem::ShMemProvider,
     staterestore::StateRestorer,
 };
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 
 #[cfg(all(unix, not(miri)))]
 use crate::events::EVENTMGR_SIGHANDLER_STATE;
 use crate::{
-    Error,
     events::{
         AwaitRestartSafe, EventFirer, EventManagerId, EventReceiver, EventRestarter,
         EventWithStats, HasEventManagerId, ProgressReporter, SendExiting,
     },
+    Error,
 };
 
 /// The llmp connection from the actual fuzzer to the process supervising it
@@ -281,6 +281,12 @@ where
 
                 #[expect(clippy::manual_assert)]
                 if !staterestorer.has_content() {
+                    // The child exited cleanly without saving any restart state.
+                    // This can happen on graceful shutdown (exit code 0). Do not treat it as an error.
+                    if child_status == 0 {
+                        return Err(Error::shutting_down());
+                    }
+
                     #[cfg(unix)]
                     if child_status == 9 {
                         panic!(
